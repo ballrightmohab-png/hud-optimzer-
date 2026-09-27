@@ -1,0 +1,136 @@
+name: Build HUD Optimizer
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build HUD Optimizer ARM64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find Android NDK
+        shell: bash
+        run: |
+          NDK_PATH="$(find "$ANDROID_HOME/ndk" \
+            -maxdepth 1 \
+            -mindepth 1 \
+            -type d \
+            | sort -V \
+            | tail -n 1)"
+
+          if [ -z "$NDK_PATH" ]; then
+            echo "ERROR: Android NDK not found."
+            exit 1
+          fi
+
+          echo "Using NDK: $NDK_PATH"
+          echo "NDK_PATH=$NDK_PATH" >> "$GITHUB_ENV"
+
+      - name: Configure CMake
+        run: |
+          cmake \
+            -S . \
+            -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build HUD Optimizer
+        run: |
+          cmake \
+            --build build \
+            --config Release \
+            --parallel 2
+
+      - name: Find built library
+        shell: bash
+        run: |
+          echo "Searching for libhud_optimizer.so..."
+
+          SO_PATH="$(find build \
+            -type f \
+            -name "libhud_optimizer.so" \
+            | head -n 1)"
+
+          if [ -z "$SO_PATH" ]; then
+            echo "ERROR: libhud_optimizer.so was not built."
+            exit 1
+          fi
+
+          echo "Found: $SO_PATH"
+          echo "SO_PATH=$SO_PATH" >> "$GITHUB_ENV"
+
+      - name: Prepare LeviPack
+        shell: bash
+        run: |
+          rm -rf package
+          mkdir -p package
+
+          cp "$SO_PATH" \
+            package/libhud_optimizer.so
+
+          cp manifest.json \
+            package/manifest.json
+
+          echo "Package:"
+          find package -type f -exec ls -lh {} \;
+
+      - name: Verify package files
+        shell: bash
+        run: |
+          test -f package/manifest.json
+          test -f package/libhud_optimizer.so
+
+          echo "Package files verified."
+
+      - name: Install ZIP utility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip unzip
+
+      - name: Create LeviPack
+        shell: bash
+        run: |
+          cd package
+
+          zip -9 \
+            ../HUDOptimizer-ARM64.levipack \
+            manifest.json \
+            libhud_optimizer.so
+
+          cd ..
+
+          echo "Created:"
+          ls -lh HUDOptimizer-ARM64.levipack
+
+      - name: Verify LeviPack ZIP
+        shell: bash
+        run: |
+          echo "========== LEVIPACK CONTENTS =========="
+
+          unzip -l HUDOptimizer-ARM64.levipack
+
+          echo "========== ZIP TEST =========="
+
+          unzip -t HUDOptimizer-ARM64.levipack
+
+          echo "LeviPack ZIP verification successful."
+
+      - name: Upload LeviPack
+        uses: actions/upload-artifact@v4
+        with:
+          name: HUDOptimizer-ARM64-LeviPack
+          path: HUDOptimizer-ARM64.levipack
+          if-no-files-found: error
