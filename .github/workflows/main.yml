@@ -1,0 +1,98 @@
+name: Build HUD Optimizer
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build HUD Optimizer ARM64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find Android NDK
+        shell: bash
+        run: |
+          NDK_PATH="$(find "$ANDROID_HOME/ndk" \
+            -maxdepth 1 \
+            -mindepth 1 \
+            -type d | sort -V | tail -n 1)"
+
+          if [ -z "$NDK_PATH" ]; then
+            echo "No Android NDK found."
+            exit 1
+          fi
+
+          echo "Using NDK: $NDK_PATH"
+          echo "NDK_PATH=$NDK_PATH" >> "$GITHUB_ENV"
+
+      - name: Configure CMake
+        run: |
+          cmake \
+            -S . \
+            -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-30 \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: |
+          cmake --build build \
+            --config Release \
+            --parallel 2
+
+      - name: Create LeviPack
+        shell: bash
+        run: |
+          rm -rf package
+          mkdir -p package
+
+          cp build/libhud_optimizer.so \
+             package/libhud_optimizer.so
+
+          cp manifest.json \
+             package/manifest.json
+
+          echo "Package contents:"
+          find package -type f -print
+
+      - name: Verify LeviPack contents
+        shell: bash
+        run: |
+          test -f package/libhud_optimizer.so
+          test -f package/manifest.json
+
+          echo "Package verification passed."
+
+      - name: Create .levipack
+        shell: bash
+        run: |
+          tar -cf HUDOptimizer-ARM64.levipack \
+            -C package \
+            manifest.json \
+            libhud_optimizer.so
+
+          echo "LeviPack created:"
+          ls -lh HUDOptimizer-ARM64.levipack
+
+      - name: Verify .levipack
+        shell: bash
+        run: |
+          echo "LeviPack contents:"
+          tar -tf HUDOptimizer-ARM64.levipack
+
+      - name: Upload LeviPack
+        uses: actions/upload-artifact@v4
+        with:
+          name: HUDOptimizer-ARM64-LeviPack
+          path: HUDOptimizer-ARM64.levipack
