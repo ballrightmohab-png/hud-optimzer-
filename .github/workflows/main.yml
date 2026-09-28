@@ -4,9 +4,12 @@ on:
   push:
     branches:
       - main
+      - experimental/*
+      - "**/hud-optimizer-rewrite"
   pull_request:
     branches:
       - main
+      - experimental/*
   workflow_dispatch:
 
 jobs:
@@ -30,7 +33,7 @@ jobs:
 
           if [ -z "$NDK_PATH" ]; then
             echo "ERROR: Android NDK not found."
-            echo "Available NDK versions:"
+            echo "Available NDK directory content:"
             ls -la "$ANDROID_HOME/ndk/" || echo "NDK directory not found"
             exit 1
           fi
@@ -176,6 +179,9 @@ jobs:
             echo "ERROR: ZIP integrity check failed"
             exit 1
           fi
+
+          echo -e "\n========== SHA-256 CHECKSUM =========="
+          sha256sum HUDOptimizer-ARM64.levipack
 
       - name: Upload LeviPack Artifact
         uses: actions/upload-artifact@v4
