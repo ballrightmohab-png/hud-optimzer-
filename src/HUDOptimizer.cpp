@@ -325,6 +325,7 @@ private:
                .modId("hud_optimizer")
                .defaultEnabled(true)
                .hideInHudEditor(false)
+               .config("enabled", "Enable Optimizer Engine", ConfigType::Toggle, "true")
                .config("clean_hud", "Clean HUD Mode", ConfigType::Toggle, "false")
                .config("cache_hotbar", "Cache Hotbar Slots", ConfigType::Toggle, "true")
                .config("cache_vitals", "Cache Health/Hunger/Armor/XP", ConfigType::Toggle, "true")
@@ -339,7 +340,9 @@ private:
                    auto& cfg = HUDOptimizer::getConfig();
                    bool boolVal = (value == "true" || value == "1");
 
-                   if (key == "clean_hud") {
+                   if (key == "enabled") {
+                       cfg.enabled.store(boolVal, std::memory_order_relaxed);
+                   } else if (key == "clean_hud") {
                        cfg.cleanHudMode.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "cache_hotbar") {
                        cfg.cacheHotbar.store(boolVal, std::memory_order_relaxed);
@@ -360,6 +363,26 @@ private:
             mSelf.getLogger().info("HUD Optimizer ModMenu module registered successfully.");
         } else {
             mSelf.getLogger().warn("Failed to register HUD Optimizer ModMenu module.");
+        }
+
+        // Register Quick Toggle On-Screen Button
+        ButtonBuilder toggleButton("hud_opt_toggle_btn", "HUD Optimizer Toggle");
+        toggleButton.moduleId("hud_optimizer_module")
+                    .modId("hud_optimizer")
+                    .label("HUD Opt: ON")
+                    .behavior(ButtonBehavior::Toggle)
+                    .defaultVisible(true)
+                    .stylePreset(ButtonStylePreset::Accent)
+                    .onEvent([](std::string_view buttonId, ButtonEvent event, float value) {
+                        if (event == ButtonEvent::Click || event == ButtonEvent::StateChanged) {
+                            bool newVisible = value > 0.5f;
+                            HUDOptimizer::getConfig().enabled.store(newVisible, std::memory_order_relaxed);
+                            HUDOptimizer::invalidateAllCaches();
+                        }
+                    });
+
+        if (toggleButton.registerButton()) {
+            mSelf.getLogger().info("HUD Optimizer ModMenu quick toggle button registered.");
         }
     }
 
@@ -398,6 +421,7 @@ public:
         HUDOptimizer::getConfig().enabled.store(false, std::memory_order_relaxed);
         HUDOptimizer::invalidateAllCaches();
         HUDOptimizer::Hooks::uninstallHooks();
+        pl::modmenu::unregisterButton("hud_opt_toggle_btn");
         pl::modmenu::unregisterModule("hud_optimizer_module");
         return true;
     }
