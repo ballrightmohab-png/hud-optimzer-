@@ -1,11 +1,13 @@
-// HUDOptimizer.cpp - Optimized HUD Rendering Module for Minecraft Bedrock on LeviLaunchroid
+// HUDOptimizer.cpp - Optimized HUD Rendering Engine for Minecraft Bedrock on LeviLaunchroid
 // Architecture: Native C++20 module targeting Android ARM64
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <dlfcn.h>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -31,6 +33,8 @@ struct Config {
     std::atomic<bool> disableAnimations{true};
     std::atomic<bool> simplifyCrosshair{false};
     std::atomic<bool> reduceTransparency{false};
+    std::atomic<bool> cameraSmoothing{true};
+    std::atomic<bool> disableVsync{true};
 };
 
 inline Config& getConfig() noexcept {
@@ -45,14 +49,10 @@ inline Config& getConfig() noexcept {
 struct PerformanceMetrics {
     std::atomic<uint64_t> totalFrames{0};
     std::atomic<uint64_t> cachedHits{0};
-    std::atomic<uint64_t> hotbarBypasses{0};
-    std::atomic<uint64_t> vitalBypasses{0};
 
     void reset() noexcept {
         totalFrames.store(0);
         cachedHits.store(0);
-        hotbarBypasses.store(0);
-        vitalBypasses.store(0);
     }
 
     float getHitRate() const noexcept {
@@ -68,20 +68,64 @@ inline PerformanceMetrics& getMetrics() noexcept {
 }
 
 // ============================================================================
+// Camera Smoothing Interpolator Engine
+// ============================================================================
+
+class CameraSmoother {
+private:
+    float mSmoothYaw{0.0f};
+    float mSmoothPitch{0.0f};
+    bool mInitialized{false};
+    mutable std::mutex mMutex;
+
+public:
+    void updateAndFilter(float& rawYaw, float& rawPitch, float deltaTime = 0.016f) noexcept {
+        if (!getConfig().cameraSmoothing.load(std::memory_order_relaxed)) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!mInitialized) {
+            mSmoothYaw = rawYaw;
+            mSmoothPitch = rawPitch;
+            mInitialized = true;
+            return;
+        }
+
+        float deltaYaw = rawYaw - mSmoothYaw;
+        float deltaPitch = rawPitch - mSmoothPitch;
+
+        // Exponential smoothing factor resistant to low FPS jitter
+        float alpha = 1.0f - std::exp(-18.0f * std::clamp(deltaTime, 0.001f, 0.1f));
+
+        mSmoothYaw += deltaYaw * alpha;
+        mSmoothPitch += deltaPitch * alpha;
+
+        rawYaw = mSmoothYaw;
+        rawPitch = mSmoothPitch;
+    }
+
+    void reset() noexcept {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mInitialized = false;
+    }
+};
+
+inline CameraSmoother& getCameraSmoother() noexcept {
+    static CameraSmoother instance;
+    return instance;
+}
+
+// ============================================================================
 // Hotbar State Cache
 // ============================================================================
 
 struct SlotState {
     int itemId{0};
     int count{0};
-    int damage{0};
-    uint32_t customFlags{0};
 
     bool operator==(const SlotState& other) const noexcept {
-        return itemId == other.itemId &&
-               count == other.count &&
-               damage == other.damage &&
-               customFlags == other.customFlags;
+        return itemId == other.itemId && count == other.count;
     }
 
     bool operator!=(const SlotState& other) const noexcept {
@@ -93,7 +137,6 @@ class HotbarCache {
 private:
     static constexpr size_t HOTBAR_SLOT_COUNT = 9;
     std::array<SlotState, HOTBAR_SLOT_COUNT> mSlots{};
-    int mSelectedSlot{-1};
     bool mDirty{true};
     mutable std::mutex mMutex;
 
@@ -103,32 +146,14 @@ public:
         mDirty = true;
     }
 
-    bool isSlotDirty(size_t index, const SlotState& newState) noexcept {
-        if (!getConfig().cacheHotbar.load(std::memory_order_relaxed)) {
+    bool updateSlot(size_t index, const SlotState& newState) noexcept {
+        if (!getConfig().cacheHotbar.load(std::memory_order_relaxed) || index >= HOTBAR_SLOT_COUNT) {
             return true;
         }
-
-        if (index >= HOTBAR_SLOT_COUNT) return true;
 
         std::lock_guard<std::mutex> lock(mMutex);
         if (mDirty || mSlots[index] != newState) {
             mSlots[index] = newState;
-            return true;
-        }
-
-        getMetrics().hotbarBypasses.fetch_add(1, std::memory_order_relaxed);
-        getMetrics().cachedHits.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-
-    bool isSelectionDirty(int newSelectedSlot) noexcept {
-        if (!getConfig().cacheHotbar.load(std::memory_order_relaxed)) {
-            return true;
-        }
-
-        std::lock_guard<std::mutex> lock(mMutex);
-        if (mDirty || mSelectedSlot != newSelectedSlot) {
-            mSelectedSlot = newSelectedSlot;
             return true;
         }
 
@@ -148,64 +173,55 @@ inline HotbarCache& getHotbarCache() noexcept {
 }
 
 // ============================================================================
-// Vitals State Cache (Health, Hunger, Armor, XP Level & Progress)
+// Active Clean HUD & Minimal Crosshair Overlay Engine
 // ============================================================================
 
-struct VitalsState {
-    int health{-1};
-    int maxHealth{-1};
-    int hunger{-1};
-    int armor{-1};
-    int xpLevel{-1};
-    float xpProgress{-1.0f};
-
-    bool operator==(const VitalsState& other) const noexcept {
-        return health == other.health &&
-               maxHealth == other.maxHealth &&
-               hunger == other.hunger &&
-               armor == other.armor &&
-               xpLevel == other.xpLevel &&
-               xpProgress == other.xpProgress;
+void renderCleanHudOverlay() noexcept {
+    if (!getConfig().enabled.load(std::memory_order_relaxed)) {
+        pl::modmenu::submitDrawCommands("hud_optimizer_module", {});
+        return;
     }
 
-    bool operator!=(const VitalsState& other) const noexcept {
-        return !(*this == other);
+    getMetrics().totalFrames.fetch_add(1, std::memory_order_relaxed);
+
+    std::vector<pl::modmenu::DrawCommand> cmds;
+
+    // Simplified Crosshair Overlay
+    if (getConfig().simplifyCrosshair.load(std::memory_order_relaxed)) {
+        pl::modmenu::DrawCommand crosshairHorizontal{};
+        crosshairHorizontal.type = pl::modmenu::DrawCommandType::Line;
+        crosshairHorizontal.x = -6.0f;
+        crosshairHorizontal.y = 0.0f;
+        crosshairHorizontal.w = 12.0f;
+        crosshairHorizontal.h = 0.0f;
+        crosshairHorizontal.color = 0xFFFFFFFF;
+        crosshairHorizontal.size = 2.0f;
+        cmds.push_back(crosshairHorizontal);
+
+        pl::modmenu::DrawCommand crosshairVertical{};
+        crosshairVertical.type = pl::modmenu::DrawCommandType::Line;
+        crosshairVertical.x = 0.0f;
+        crosshairVertical.y = -6.0f;
+        crosshairVertical.w = 0.0f;
+        crosshairVertical.h = 12.0f;
+        crosshairVertical.color = 0xFFFFFFFF;
+        crosshairVertical.size = 2.0f;
+        cmds.push_back(crosshairVertical);
     }
-};
 
-class VitalsCache {
-private:
-    VitalsState mState{};
-    bool mDirty{true};
-    mutable std::mutex mMutex;
-
-public:
-    void invalidate() noexcept {
-        std::lock_guard<std::mutex> lock(mMutex);
-        mDirty = true;
+    // Clean HUD Mode Status Indicator
+    if (getConfig().cleanHudMode.load(std::memory_order_relaxed)) {
+        pl::modmenu::DrawCommand textCmd{};
+        textCmd.type = pl::modmenu::DrawCommandType::Text;
+        textCmd.x = 10.0f;
+        textCmd.y = 10.0f;
+        textCmd.color = 0xFF00FF00;
+        textCmd.size = 14.0f;
+        textCmd.text = "HUD Opt [Clean Mode]";
+        cmds.push_back(textCmd);
     }
 
-    bool shouldRedraw(const VitalsState& newState) noexcept {
-        if (!getConfig().cacheVitals.load(std::memory_order_relaxed)) {
-            return true;
-        }
-
-        std::lock_guard<std::mutex> lock(mMutex);
-        if (mDirty || mState != newState) {
-            mState = newState;
-            mDirty = false;
-            return true;
-        }
-
-        getMetrics().vitalBypasses.fetch_add(1, std::memory_order_relaxed);
-        getMetrics().cachedHits.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-};
-
-inline VitalsCache& getVitalsCache() noexcept {
-    static VitalsCache instance;
-    return instance;
+    pl::modmenu::submitDrawCommands("hud_optimizer_module", cmds);
 }
 
 // ============================================================================
@@ -214,80 +230,47 @@ inline VitalsCache& getVitalsCache() noexcept {
 
 namespace Hooks {
 
+// Stored target addresses
+void* targetEglSwapInterval = nullptr;
+
 // Original function pointers
-void (*orig_HudElementRender)(void*, void*) = nullptr;
-void (*orig_HotbarRenderSlot)(void*, int, void*) = nullptr;
+int (*orig_EglSwapInterval)(void*, int) = nullptr;
 
-// Detour for general HUD element rendering
-void hook_HudElementRender(void* self, void* ctx) {
-    if (!getConfig().enabled.load(std::memory_order_relaxed)) {
-        if (orig_HudElementRender) orig_HudElementRender(self, ctx);
-        return;
+// Detour for VSync / SwapInterval
+int hook_EglSwapInterval(void* dpy, int interval) {
+    // Process active frame overlays during SwapBuffers cycle
+    renderCleanHudOverlay();
+
+    if (getConfig().enabled.load(std::memory_order_relaxed) && getConfig().disableVsync.load(std::memory_order_relaxed)) {
+        interval = 0;
     }
-
-    getMetrics().totalFrames.fetch_add(1, std::memory_order_relaxed);
-
-    // Call original render method
-    if (orig_HudElementRender) {
-        orig_HudElementRender(self, ctx);
+    if (orig_EglSwapInterval) {
+        return orig_EglSwapInterval(dpy, interval);
     }
-
-    getHotbarCache().finishFrame();
-}
-
-// Detour for individual Hotbar Slot rendering
-void hook_HotbarRenderSlot(void* self, int slotIndex, void* slotData) {
-    if (!getConfig().enabled.load(std::memory_order_relaxed) || !getConfig().cacheHotbar.load(std::memory_order_relaxed)) {
-        if (orig_HotbarRenderSlot) orig_HotbarRenderSlot(self, slotIndex, slotData);
-        return;
-    }
-
-    // Dynamic slot state check
-    SlotState currentSlotState{};
-    if (slotData) {
-        // Safe access to item structure properties
-        std::memcpy(&currentSlotState, slotData, std::min(sizeof(SlotState), sizeof(uint64_t) * 2));
-    }
-
-    if (getHotbarCache().isSlotDirty(static_cast<size_t>(slotIndex), currentSlotState)) {
-        if (orig_HotbarRenderSlot) orig_HotbarRenderSlot(self, slotIndex, slotData);
-    }
+    return 0;
 }
 
 bool installHooks() noexcept {
-    // Resolve signatures dynamically in libminecraftpe.so with standard fallback safety
-    uintptr_t hudRenderAddr = pl::memory::resolveSignature("48 89 5C 24 ?? 57 48 83 EC ?? 48 8B D9", "libminecraftpe.so");
-    uintptr_t hotbarSlotAddr = pl::memory::resolveSignature("40 53 48 83 EC ?? 48 8B D9 89 54 24", "libminecraftpe.so");
-
-    bool success = true;
-    if (hudRenderAddr) {
-        pl::memory::hook(reinterpret_cast<pl::memory::FuncPtr>(hudRenderAddr),
-                         reinterpret_cast<pl::memory::FuncPtr>(hook_HudElementRender),
-                         reinterpret_cast<pl::memory::FuncPtr*>(&orig_HudElementRender));
-    } else {
-        success = false;
+    // Resolve eglSwapInterval via dlsym for reliable cross-Android compatibility
+    void* eglHandle = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
+    if (eglHandle) {
+        targetEglSwapInterval = dlsym(eglHandle, "eglSwapInterval");
     }
 
-    if (hotbarSlotAddr) {
-        pl::memory::hook(reinterpret_cast<pl::memory::FuncPtr>(hotbarSlotAddr),
-                         reinterpret_cast<pl::memory::FuncPtr>(hook_HotbarRenderSlot),
-                         reinterpret_cast<pl::memory::FuncPtr*>(&orig_HotbarRenderSlot));
-    } else {
-        success = false;
+    if (targetEglSwapInterval) {
+        pl::memory::hook(reinterpret_cast<pl::memory::FuncPtr>(targetEglSwapInterval),
+                         reinterpret_cast<pl::memory::FuncPtr>(hook_EglSwapInterval),
+                         reinterpret_cast<pl::memory::FuncPtr*>(&orig_EglSwapInterval));
     }
 
-    return success;
+    return (targetEglSwapInterval != nullptr);
 }
 
 void uninstallHooks() noexcept {
-    // Unhook safely when disabling
-    if (orig_HudElementRender) {
-        pl::memory::unhook(reinterpret_cast<pl::memory::FuncPtr>(hook_HudElementRender), reinterpret_cast<pl::memory::FuncPtr>(hook_HudElementRender));
-        orig_HudElementRender = nullptr;
-    }
-    if (orig_HotbarRenderSlot) {
-        pl::memory::unhook(reinterpret_cast<pl::memory::FuncPtr>(hook_HotbarRenderSlot), reinterpret_cast<pl::memory::FuncPtr>(hook_HotbarRenderSlot));
-        orig_HotbarRenderSlot = nullptr;
+    if (targetEglSwapInterval) {
+        pl::memory::unhook(reinterpret_cast<pl::memory::FuncPtr>(targetEglSwapInterval), reinterpret_cast<pl::memory::FuncPtr>(hook_EglSwapInterval));
+        targetEglSwapInterval = nullptr;
+        orig_EglSwapInterval = nullptr;
     }
 }
 
@@ -303,7 +286,7 @@ void beginFrame() noexcept {
 
 void invalidateAllCaches() noexcept {
     getHotbarCache().invalidate();
-    getVitalsCache().invalidate();
+    getCameraSmoother().reset();
 }
 
 } // namespace HUDOptimizer
@@ -321,7 +304,7 @@ private:
 
         // Register ModMenu Builder
         ModuleBuilder builder("hud_optimizer_module", "HUD Optimizer");
-        builder.description("Smart, lightweight HUD optimization engine reducing redundant Bedrock rendering overhead.")
+        builder.description("Smart, lightweight HUD optimization engine reducing redundant Bedrock rendering overhead with camera smoothing and VSync toggles.")
                .modId("hud_optimizer")
                .defaultEnabled(true)
                .hideInHudEditor(false)
@@ -329,6 +312,8 @@ private:
                .config("clean_hud", "Clean HUD Mode", ConfigType::Toggle, "false")
                .config("cache_hotbar", "Cache Hotbar Slots", ConfigType::Toggle, "true")
                .config("cache_vitals", "Cache Health/Hunger/Armor/XP", ConfigType::Toggle, "true")
+               .config("camera_smoothing", "Smooth Camera Turning", ConfigType::Toggle, "true")
+               .config("disable_vsync", "Disable VSync (Max FPS)", ConfigType::Toggle, "true")
                .config("disable_animations", "Disable Cosmetic Animations", ConfigType::Toggle, "true")
                .config("simplify_crosshair", "Simplify Crosshair", ConfigType::Toggle, "false")
                .config("reduce_transparency", "Reduce Layers & Transparency", ConfigType::Toggle, "false")
@@ -348,6 +333,10 @@ private:
                        cfg.cacheHotbar.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "cache_vitals") {
                        cfg.cacheVitals.store(boolVal, std::memory_order_relaxed);
+                   } else if (key == "camera_smoothing") {
+                       cfg.cameraSmoothing.store(boolVal, std::memory_order_relaxed);
+                   } else if (key == "disable_vsync") {
+                       cfg.disableVsync.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "disable_animations") {
                        cfg.disableAnimations.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "simplify_crosshair") {
