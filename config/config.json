@@ -8,6 +8,7 @@
     "cache_text": true,
     "camera_smoothing": true,
     "disable_vsync": true,
+    "entity_culling": true,
     "disable_animations": true,
     "simplify_crosshair": false,
     "reduce_transparency": false,

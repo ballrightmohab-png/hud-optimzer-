@@ -374,7 +374,7 @@ inline TextCache& getTextCache() noexcept {
 }
 
 // ============================================================================
-// Hotbar State Cache
+// Hotbar State & Vitals Cache Engine (Dirty-Checking State Tracker)
 // ============================================================================
 
 struct SlotState {
@@ -390,10 +390,27 @@ struct SlotState {
     }
 };
 
+struct VitalsState {
+    int health{20};
+    int hunger{20};
+    int armor{0};
+    int selectedSlot{0};
+
+    bool operator==(const VitalsState& other) const noexcept {
+        return health == other.health && hunger == other.hunger &&
+               armor == other.armor && selectedSlot == other.selectedSlot;
+    }
+
+    bool operator!=(const VitalsState& other) const noexcept {
+        return !(*this == other);
+    }
+};
+
 class HotbarCache {
 private:
     static constexpr size_t HOTBAR_SLOT_COUNT = 9;
     std::array<SlotState, HOTBAR_SLOT_COUNT> mSlots{};
+    VitalsState mVitals{};
     bool mDirty{true};
     mutable std::mutex mMutex;
 
@@ -411,6 +428,21 @@ public:
         std::lock_guard<std::mutex> lock(mMutex);
         if (mDirty || mSlots[index] != newState) {
             mSlots[index] = newState;
+            return true;
+        }
+
+        getProfiler().recordCacheHit();
+        return false;
+    }
+
+    bool updateVitals(const VitalsState& newVitals) noexcept {
+        if (!getConfig().cacheVitals.load(std::memory_order_relaxed)) {
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (mDirty || mVitals != newVitals) {
+            mVitals = newVitals;
             return true;
         }
 
@@ -445,8 +477,10 @@ public:
 
         if (distanceSquared > maxDistanceSquared) {
             mEntitiesCulled.fetch_add(1, std::memory_order_relaxed);
+            getProfiler().recordSkipped(1);
             return false;
         }
+        getProfiler().recordRendered(1);
         return true;
     }
 
