@@ -120,10 +120,13 @@ jobs:
           echo "Preparing package contents..."
           
           rm -rf package
-          mkdir -p package
+          mkdir -p package/config
 
           cp "$SO_PATH" package/libhud_optimizer.so
           cp manifest.json package/manifest.json
+          if [ -f config/config.json ]; then
+            cp config/config.json package/config/config.json
+          fi
 
           echo "✓ Package contents:"
           find package -type f -exec ls -lh {} \;
@@ -151,10 +154,11 @@ jobs:
           
           cd package
 
-          zip -9 -v \
+          zip -9 -v -r \
             ../HUDOptimizer-ARM64.levipack \
             manifest.json \
-            libhud_optimizer.so
+            libhud_optimizer.so \
+            config
 
           if [ $? -ne 0 ]; then
             echo "ERROR: Failed to create LeviPack ZIP"

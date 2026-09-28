@@ -22,6 +22,7 @@ add_library(hud_optimizer SHARED
 target_link_libraries(hud_optimizer
     PRIVATE
     preloader
+    nlohmann_json::nlohmann_json
     log
 )
 

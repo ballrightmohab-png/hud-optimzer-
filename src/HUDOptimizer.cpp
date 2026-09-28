@@ -8,11 +8,15 @@
 #include <cstdint>
 #include <cstring>
 #include <dlfcn.h>
+#include <fstream>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include <pl/Mod.hpp>
 #include <pl/ModMenu.hpp>
@@ -40,6 +44,61 @@ struct Config {
 inline Config& getConfig() noexcept {
     static Config instance;
     return instance;
+}
+
+void loadConfigFile(const std::filesystem::path& configDir) {
+    try {
+        std::filesystem::create_directories(configDir);
+        std::filesystem::path filePath = configDir / "config.json";
+
+        if (std::filesystem::exists(filePath)) {
+            std::ifstream file(filePath);
+            if (file.is_open()) {
+                nlohmann::json j;
+                file >> j;
+
+                auto& cfg = getConfig();
+                if (j.contains("enabled")) cfg.enabled.store(j["enabled"].get<bool>(), std::memory_order_relaxed);
+                if (j.contains("clean_hud")) cfg.cleanHudMode.store(j["clean_hud"].get<bool>(), std::memory_order_relaxed);
+                if (j.contains("cache_hotbar")) cfg.cacheHotbar.store(j["cache_hotbar"].get<bool>(), std::memory_order_relaxed);
+                if (j.contains("cache_vitals")) cfg.cacheVitals.store(j["cache_vitals"].get<bool>(), std::memory_order_relaxed);
+                if (j.contains("camera_smoothing")) cfg.cameraSmoothing.store(j["camera_smoothing"].get<bool>(), std::memory_order_relaxed);
+                if (j.contains("disable_vsync")) cfg.disableVsync.store(j["disable_vsync"].get<bool>(), std::memory_order_relaxed);
+                if (j.contains("disable_animations")) cfg.disableAnimations.store(j["disable_animations"].get<bool>(), std::memory_order_relaxed);
+                if (j.contains("simplify_crosshair")) cfg.simplifyCrosshair.store(j["simplify_crosshair"].get<bool>(), std::memory_order_relaxed);
+                if (j.contains("reduce_transparency")) cfg.reduceTransparency.store(j["reduce_transparency"].get<bool>(), std::memory_order_relaxed);
+            }
+        }
+    } catch (...) {
+        // Fallback safely to defaults if file read or parse fails
+    }
+}
+
+void saveConfigFile(const std::filesystem::path& configDir) {
+    try {
+        std::filesystem::create_directories(configDir);
+        std::filesystem::path filePath = configDir / "config.json";
+
+        auto& cfg = getConfig();
+        nlohmann::json j = {
+            {"enabled", cfg.enabled.load(std::memory_order_relaxed)},
+            {"clean_hud", cfg.cleanHudMode.load(std::memory_order_relaxed)},
+            {"cache_hotbar", cfg.cacheHotbar.load(std::memory_order_relaxed)},
+            {"cache_vitals", cfg.cacheVitals.load(std::memory_order_relaxed)},
+            {"camera_smoothing", cfg.cameraSmoothing.load(std::memory_order_relaxed)},
+            {"disable_vsync", cfg.disableVsync.load(std::memory_order_relaxed)},
+            {"disable_animations", cfg.disableAnimations.load(std::memory_order_relaxed)},
+            {"simplify_crosshair", cfg.simplifyCrosshair.load(std::memory_order_relaxed)},
+            {"reduce_transparency", cfg.reduceTransparency.load(std::memory_order_relaxed)}
+        };
+
+        std::ofstream file(filePath);
+        if (file.is_open()) {
+            file << j.dump(4);
+        }
+    } catch (...) {
+        // Silently ignore save exceptions
+    }
 }
 
 // ============================================================================
@@ -302,50 +361,54 @@ private:
     void registerModMenuControls() {
         using namespace pl::modmenu;
 
+        auto& cfg = HUDOptimizer::getConfig();
+
         // Register ModMenu Builder
         ModuleBuilder builder("hud_optimizer_module", "HUD Optimizer");
         builder.description("Smart, lightweight HUD optimization engine reducing redundant Bedrock rendering overhead with camera smoothing and VSync toggles.")
                .modId("hud_optimizer")
                .defaultEnabled(true)
                .hideInHudEditor(false)
-               .config("enabled", "Enable Optimizer Engine", ConfigType::Toggle, "true")
-               .config("clean_hud", "Clean HUD Mode", ConfigType::Toggle, "false")
-               .config("cache_hotbar", "Cache Hotbar Slots", ConfigType::Toggle, "true")
-               .config("cache_vitals", "Cache Health/Hunger/Armor/XP", ConfigType::Toggle, "true")
-               .config("camera_smoothing", "Smooth Camera Turning", ConfigType::Toggle, "true")
-               .config("disable_vsync", "Disable VSync (Max FPS)", ConfigType::Toggle, "true")
-               .config("disable_animations", "Disable Cosmetic Animations", ConfigType::Toggle, "true")
-               .config("simplify_crosshair", "Simplify Crosshair", ConfigType::Toggle, "false")
-               .config("reduce_transparency", "Reduce Layers & Transparency", ConfigType::Toggle, "false")
-               .onToggle([](std::string_view moduleId, bool enabled) {
+               .config("enabled", "Enable Optimizer Engine", ConfigType::Toggle, cfg.enabled.load() ? "true" : "false")
+               .config("clean_hud", "Clean HUD Mode", ConfigType::Toggle, cfg.cleanHudMode.load() ? "true" : "false")
+               .config("cache_hotbar", "Cache Hotbar Slots", ConfigType::Toggle, cfg.cacheHotbar.load() ? "true" : "false")
+               .config("cache_vitals", "Cache Health/Hunger/Armor/XP", ConfigType::Toggle, cfg.cacheVitals.load() ? "true" : "false")
+               .config("camera_smoothing", "Smooth Camera Turning", ConfigType::Toggle, cfg.cameraSmoothing.load() ? "true" : "false")
+               .config("disable_vsync", "Disable VSync (Max FPS)", ConfigType::Toggle, cfg.disableVsync.load() ? "true" : "false")
+               .config("disable_animations", "Disable Cosmetic Animations", ConfigType::Toggle, cfg.disableAnimations.load() ? "true" : "false")
+               .config("simplify_crosshair", "Simplify Crosshair", ConfigType::Toggle, cfg.simplifyCrosshair.load() ? "true" : "false")
+               .config("reduce_transparency", "Reduce Layers & Transparency", ConfigType::Toggle, cfg.reduceTransparency.load() ? "true" : "false")
+               .onToggle([this](std::string_view moduleId, bool enabled) {
                    HUDOptimizer::getConfig().enabled.store(enabled, std::memory_order_relaxed);
                    HUDOptimizer::invalidateAllCaches();
+                   HUDOptimizer::saveConfigFile(mSelf.getConfigDir());
                })
-               .onConfigChanged([](std::string_view moduleId, std::string_view key, std::string_view value) {
-                   auto& cfg = HUDOptimizer::getConfig();
+               .onConfigChanged([this](std::string_view moduleId, std::string_view key, std::string_view value) {
+                   auto& cfgState = HUDOptimizer::getConfig();
                    bool boolVal = (value == "true" || value == "1");
 
                    if (key == "enabled") {
-                       cfg.enabled.store(boolVal, std::memory_order_relaxed);
+                       cfgState.enabled.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "clean_hud") {
-                       cfg.cleanHudMode.store(boolVal, std::memory_order_relaxed);
+                       cfgState.cleanHudMode.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "cache_hotbar") {
-                       cfg.cacheHotbar.store(boolVal, std::memory_order_relaxed);
+                       cfgState.cacheHotbar.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "cache_vitals") {
-                       cfg.cacheVitals.store(boolVal, std::memory_order_relaxed);
+                       cfgState.cacheVitals.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "camera_smoothing") {
-                       cfg.cameraSmoothing.store(boolVal, std::memory_order_relaxed);
+                       cfgState.cameraSmoothing.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "disable_vsync") {
-                       cfg.disableVsync.store(boolVal, std::memory_order_relaxed);
+                       cfgState.disableVsync.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "disable_animations") {
-                       cfg.disableAnimations.store(boolVal, std::memory_order_relaxed);
+                       cfgState.disableAnimations.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "simplify_crosshair") {
-                       cfg.simplifyCrosshair.store(boolVal, std::memory_order_relaxed);
+                       cfgState.simplifyCrosshair.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "reduce_transparency") {
-                       cfg.reduceTransparency.store(boolVal, std::memory_order_relaxed);
+                       cfgState.reduceTransparency.store(boolVal, std::memory_order_relaxed);
                    }
 
                    HUDOptimizer::invalidateAllCaches();
+                   HUDOptimizer::saveConfigFile(mSelf.getConfigDir());
                });
 
         if (builder.registerModule()) {
@@ -362,11 +425,12 @@ private:
                     .behavior(ButtonBehavior::Toggle)
                     .defaultVisible(true)
                     .stylePreset(ButtonStylePreset::Accent)
-                    .onEvent([](std::string_view buttonId, ButtonEvent event, float value) {
+                    .onEvent([this](std::string_view buttonId, ButtonEvent event, float value) {
                         if (event == ButtonEvent::Click || event == ButtonEvent::StateChanged) {
                             bool newVisible = value > 0.5f;
                             HUDOptimizer::getConfig().enabled.store(newVisible, std::memory_order_relaxed);
                             HUDOptimizer::invalidateAllCaches();
+                            HUDOptimizer::saveConfigFile(mSelf.getConfigDir());
                         }
                     });
 
@@ -385,12 +449,13 @@ public:
 
     bool load() noexcept {
         mSelf.getLogger().info("Loading HUD Optimizer Native Engine...");
+        HUDOptimizer::loadConfigFile(mSelf.getConfigDir());
         return true;
     }
 
     bool enable() noexcept {
         mSelf.getLogger().info("Enabling HUD Optimizer...");
-        HUDOptimizer::getConfig().enabled.store(true, std::memory_order_relaxed);
+        HUDOptimizer::loadConfigFile(mSelf.getConfigDir());
         HUDOptimizer::invalidateAllCaches();
 
         bool hooksInstalled = HUDOptimizer::Hooks::installHooks();
