@@ -1,11 +1,15 @@
 {
     "enabled": true,
+    "preset": 0,
+    "adaptive_mode": true,
     "clean_hud": false,
     "cache_hotbar": true,
     "cache_vitals": true,
+    "cache_text": true,
     "camera_smoothing": true,
     "disable_vsync": true,
     "disable_animations": true,
     "simplify_crosshair": false,
-    "reduce_transparency": false
+    "reduce_transparency": false,
+    "show_profiler": false
 }

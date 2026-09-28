@@ -1,15 +1,17 @@
-// HUDOptimizer.cpp - Optimized HUD Rendering Engine for Minecraft Bedrock on LeviLaunchroid
+// HUDOptimizer.cpp - High-Performance HUD Rendering Engine for Minecraft Bedrock on LeviLaunchroid
 // Architecture: Native C++20 module targeting Android ARM64
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
-#include <fstream>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -26,19 +28,34 @@
 namespace HUDOptimizer {
 
 // ============================================================================
+// Performance Presets
+// ============================================================================
+
+enum class PerformancePreset : int {
+    Default = 0,
+    Performance = 1,
+    UltraPerformance = 2,
+    Custom = 3
+};
+
+// ============================================================================
 // Configuration & Settings State
 // ============================================================================
 
 struct Config {
     std::atomic<bool> enabled{true};
+    std::atomic<int> preset{static_cast<int>(PerformancePreset::Default)};
+    std::atomic<bool> adaptiveMode{true};
     std::atomic<bool> cleanHudMode{false};
     std::atomic<bool> cacheHotbar{true};
     std::atomic<bool> cacheVitals{true};
+    std::atomic<bool> cacheText{true};
     std::atomic<bool> disableAnimations{true};
     std::atomic<bool> simplifyCrosshair{false};
     std::atomic<bool> reduceTransparency{false};
     std::atomic<bool> cameraSmoothing{true};
     std::atomic<bool> disableVsync{true};
+    std::atomic<bool> showProfiler{false};
 };
 
 inline Config& getConfig() noexcept {
@@ -59,18 +76,22 @@ void loadConfigFile(const std::filesystem::path& configDir) {
 
                 auto& cfg = getConfig();
                 if (j.contains("enabled")) cfg.enabled.store(j["enabled"].get<bool>(), std::memory_order_relaxed);
+                if (j.contains("preset")) cfg.preset.store(j["preset"].get<int>(), std::memory_order_relaxed);
+                if (j.contains("adaptive_mode")) cfg.adaptiveMode.store(j["adaptive_mode"].get<bool>(), std::memory_order_relaxed);
                 if (j.contains("clean_hud")) cfg.cleanHudMode.store(j["clean_hud"].get<bool>(), std::memory_order_relaxed);
                 if (j.contains("cache_hotbar")) cfg.cacheHotbar.store(j["cache_hotbar"].get<bool>(), std::memory_order_relaxed);
                 if (j.contains("cache_vitals")) cfg.cacheVitals.store(j["cache_vitals"].get<bool>(), std::memory_order_relaxed);
+                if (j.contains("cache_text")) cfg.cacheText.store(j["cache_text"].get<bool>(), std::memory_order_relaxed);
                 if (j.contains("camera_smoothing")) cfg.cameraSmoothing.store(j["camera_smoothing"].get<bool>(), std::memory_order_relaxed);
                 if (j.contains("disable_vsync")) cfg.disableVsync.store(j["disable_vsync"].get<bool>(), std::memory_order_relaxed);
                 if (j.contains("disable_animations")) cfg.disableAnimations.store(j["disable_animations"].get<bool>(), std::memory_order_relaxed);
                 if (j.contains("simplify_crosshair")) cfg.simplifyCrosshair.store(j["simplify_crosshair"].get<bool>(), std::memory_order_relaxed);
                 if (j.contains("reduce_transparency")) cfg.reduceTransparency.store(j["reduce_transparency"].get<bool>(), std::memory_order_relaxed);
+                if (j.contains("show_profiler")) cfg.showProfiler.store(j["show_profiler"].get<bool>(), std::memory_order_relaxed);
             }
         }
     } catch (...) {
-        // Fallback safely to defaults if file read or parse fails
+        // Safe fallback to defaults if load fails
     }
 }
 
@@ -82,14 +103,18 @@ void saveConfigFile(const std::filesystem::path& configDir) {
         auto& cfg = getConfig();
         nlohmann::json j = {
             {"enabled", cfg.enabled.load(std::memory_order_relaxed)},
+            {"preset", cfg.preset.load(std::memory_order_relaxed)},
+            {"adaptive_mode", cfg.adaptiveMode.load(std::memory_order_relaxed)},
             {"clean_hud", cfg.cleanHudMode.load(std::memory_order_relaxed)},
             {"cache_hotbar", cfg.cacheHotbar.load(std::memory_order_relaxed)},
             {"cache_vitals", cfg.cacheVitals.load(std::memory_order_relaxed)},
+            {"cache_text", cfg.cacheText.load(std::memory_order_relaxed)},
             {"camera_smoothing", cfg.cameraSmoothing.load(std::memory_order_relaxed)},
             {"disable_vsync", cfg.disableVsync.load(std::memory_order_relaxed)},
             {"disable_animations", cfg.disableAnimations.load(std::memory_order_relaxed)},
             {"simplify_crosshair", cfg.simplifyCrosshair.load(std::memory_order_relaxed)},
-            {"reduce_transparency", cfg.reduceTransparency.load(std::memory_order_relaxed)}
+            {"reduce_transparency", cfg.reduceTransparency.load(std::memory_order_relaxed)},
+            {"show_profiler", cfg.showProfiler.load(std::memory_order_relaxed)}
         };
 
         std::ofstream file(filePath);
@@ -97,81 +122,201 @@ void saveConfigFile(const std::filesystem::path& configDir) {
             file << j.dump(4);
         }
     } catch (...) {
-        // Silently ignore save exceptions
+        // Ignore save errors gracefully
+    }
+}
+
+void applyPreset(PerformancePreset preset) {
+    auto& cfg = getConfig();
+    cfg.preset.store(static_cast<int>(preset), std::memory_order_relaxed);
+
+    switch (preset) {
+        case PerformancePreset::Default:
+            cfg.cacheHotbar.store(true, std::memory_order_relaxed);
+            cfg.cacheVitals.store(true, std::memory_order_relaxed);
+            cfg.cacheText.store(true, std::memory_order_relaxed);
+            cfg.disableAnimations.store(false, std::memory_order_relaxed);
+            cfg.cleanHudMode.store(false, std::memory_order_relaxed);
+            cfg.simplifyCrosshair.store(false, std::memory_order_relaxed);
+            cfg.reduceTransparency.store(false, std::memory_order_relaxed);
+            break;
+
+        case PerformancePreset::Performance:
+            cfg.cacheHotbar.store(true, std::memory_order_relaxed);
+            cfg.cacheVitals.store(true, std::memory_order_relaxed);
+            cfg.cacheText.store(true, std::memory_order_relaxed);
+            cfg.disableAnimations.store(true, std::memory_order_relaxed);
+            cfg.cleanHudMode.store(false, std::memory_order_relaxed);
+            cfg.simplifyCrosshair.store(true, std::memory_order_relaxed);
+            cfg.reduceTransparency.store(true, std::memory_order_relaxed);
+            break;
+
+        case PerformancePreset::UltraPerformance:
+            cfg.cacheHotbar.store(true, std::memory_order_relaxed);
+            cfg.cacheVitals.store(true, std::memory_order_relaxed);
+            cfg.cacheText.store(true, std::memory_order_relaxed);
+            cfg.disableAnimations.store(true, std::memory_order_relaxed);
+            cfg.cleanHudMode.store(true, std::memory_order_relaxed);
+            cfg.simplifyCrosshair.store(true, std::memory_order_relaxed);
+            cfg.reduceTransparency.store(true, std::memory_order_relaxed);
+            break;
+
+        case PerformancePreset::Custom:
+            break;
     }
 }
 
 // ============================================================================
-// Performance & Frame Metrics
+// HudProfiler - Metrics & Performance Monitoring
 // ============================================================================
 
-struct PerformanceMetrics {
-    std::atomic<uint64_t> totalFrames{0};
-    std::atomic<uint64_t> cachedHits{0};
+class HudProfiler {
+private:
+    std::atomic<uint64_t> mTotalFrames{0};
+    std::atomic<uint64_t> mCachedHits{0};
+    std::atomic<uint64_t> mElementsRendered{0};
+    std::atomic<uint64_t> mElementsSkipped{0};
+    std::atomic<double> mLastFrameTimeMs{0.0};
+    std::atomic<double> mAvgFrameTimeMs{0.0};
+    std::chrono::high_resolution_clock::time_point mFrameStart;
 
-    void reset() noexcept {
-        totalFrames.store(0);
-        cachedHits.store(0);
+public:
+    void beginFrame() noexcept {
+        mFrameStart = std::chrono::high_resolution_clock::now();
+        mTotalFrames.fetch_add(1, std::memory_order_relaxed);
     }
 
-    float getHitRate() const noexcept {
-        uint64_t total = totalFrames.load(std::memory_order_relaxed);
+    void endFrame() noexcept {
+        auto end = std::chrono::high_resolution_clock::now();
+        double durationMs = std::chrono::duration<double, std::milli>(end - mFrameStart).count();
+        mLastFrameTimeMs.store(durationMs, std::memory_order_relaxed);
+
+        double currentAvg = mAvgFrameTimeMs.load(std::memory_order_relaxed);
+        mAvgFrameTimeMs.store(currentAvg * 0.95 + durationMs * 0.05, std::memory_order_relaxed);
+    }
+
+    void recordCacheHit() noexcept {
+        mCachedHits.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void recordRendered(uint64_t count = 1) noexcept {
+        mElementsRendered.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    void recordSkipped(uint64_t count = 1) noexcept {
+        mElementsSkipped.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] double getAvgFrameTimeMs() const noexcept {
+        return mAvgFrameTimeMs.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] float getHitRate() const noexcept {
+        uint64_t total = mTotalFrames.load(std::memory_order_relaxed);
         if (total == 0) return 0.0f;
-        return (100.0f * cachedHits.load(std::memory_order_relaxed)) / total;
+        return (100.0f * mCachedHits.load(std::memory_order_relaxed)) / total;
+    }
+
+    std::string formatDebugInfo() const {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "HUD Opt | Frame: %.2f ms | Cache Hit: %.1f%% | Drawn: %llu | Skipped: %llu",
+                      mAvgFrameTimeMs.load(std::memory_order_relaxed),
+                      getHitRate(),
+                      static_cast<unsigned long long>(mElementsRendered.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(mElementsSkipped.load(std::memory_order_relaxed)));
+        return std::string(buf);
     }
 };
 
-inline PerformanceMetrics& getMetrics() noexcept {
-    static PerformanceMetrics instance;
+inline HudProfiler& getProfiler() noexcept {
+    static HudProfiler instance;
     return instance;
 }
 
 // ============================================================================
-// Camera Smoothing Interpolator Engine
+// Adaptive Performance Controller
 // ============================================================================
 
-class CameraSmoother {
+class AdaptivePerformanceController {
 private:
-    float mSmoothYaw{0.0f};
-    float mSmoothPitch{0.0f};
-    bool mInitialized{false};
-    mutable std::mutex mMutex;
+    std::atomic<bool> mDegradedMode{false};
 
 public:
-    void updateAndFilter(float& rawYaw, float& rawPitch, float deltaTime = 0.016f) noexcept {
-        if (!getConfig().cameraSmoothing.load(std::memory_order_relaxed)) {
+    void evaluate() noexcept {
+        if (!getConfig().adaptiveMode.load(std::memory_order_relaxed)) {
+            mDegradedMode.store(false, std::memory_order_relaxed);
             return;
         }
 
-        std::lock_guard<std::mutex> lock(mMutex);
-        if (!mInitialized) {
-            mSmoothYaw = rawYaw;
-            mSmoothPitch = rawPitch;
-            mInitialized = true;
-            return;
+        double frameTimeMs = getProfiler().getAvgFrameTimeMs();
+        // If frame time exceeds 16.6ms (< 60 FPS target), dynamically apply HUD reductions
+        if (frameTimeMs > 16.6) {
+            mDegradedMode.store(true, std::memory_order_relaxed);
+        } else if (frameTimeMs < 13.0) {
+            mDegradedMode.store(false, std::memory_order_relaxed);
         }
-
-        float deltaYaw = rawYaw - mSmoothYaw;
-        float deltaPitch = rawPitch - mSmoothPitch;
-
-        // Exponential smoothing factor resistant to low FPS jitter
-        float alpha = 1.0f - std::exp(-18.0f * std::clamp(deltaTime, 0.001f, 0.1f));
-
-        mSmoothYaw += deltaYaw * alpha;
-        mSmoothPitch += deltaPitch * alpha;
-
-        rawYaw = mSmoothYaw;
-        rawPitch = mSmoothPitch;
     }
 
-    void reset() noexcept {
-        std::lock_guard<std::mutex> lock(mMutex);
-        mInitialized = false;
+    [[nodiscard]] bool shouldSuppressOptionalAnimations() const noexcept {
+        return getConfig().disableAnimations.load(std::memory_order_relaxed) ||
+               mDegradedMode.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool isDegraded() const noexcept {
+        return mDegradedMode.load(std::memory_order_relaxed);
     }
 };
 
-inline CameraSmoother& getCameraSmoother() noexcept {
-    static CameraSmoother instance;
+inline AdaptivePerformanceController& getAdaptiveController() noexcept {
+    static AdaptivePerformanceController instance;
+    return instance;
+}
+
+// ============================================================================
+// Zero-Allocation TextCache Engine
+// ============================================================================
+
+class TextCache {
+private:
+    struct TextEntry {
+        std::string value;
+        double lastUpdateTime{0.0};
+    };
+
+    std::unordered_map<std::string, TextEntry> mCache;
+    mutable std::mutex mMutex;
+
+public:
+    bool shouldUpdateText(const std::string& key, const std::string& newValue, double minIntervalMs = 100.0) noexcept {
+        if (!getConfig().cacheText.load(std::memory_order_relaxed)) {
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto it = mCache.find(key);
+        if (it == mCache.end()) {
+            mCache[key] = {newValue, 0.0};
+            return true;
+        }
+
+        if (it->second.value == newValue) {
+            getProfiler().recordCacheHit();
+            return false;
+        }
+
+        it->second.value = newValue;
+        return true;
+    }
+
+    void clear() noexcept {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mCache.clear();
+    }
+};
+
+inline TextCache& getTextCache() noexcept {
+    static TextCache instance;
     return instance;
 }
 
@@ -216,7 +361,7 @@ public:
             return true;
         }
 
-        getMetrics().cachedHits.fetch_add(1, std::memory_order_relaxed);
+        getProfiler().recordCacheHit();
         return false;
     }
 
@@ -241,7 +386,8 @@ void renderCleanHudOverlay() noexcept {
         return;
     }
 
-    getMetrics().totalFrames.fetch_add(1, std::memory_order_relaxed);
+    getProfiler().beginFrame();
+    getAdaptiveController().evaluate();
 
     std::vector<pl::modmenu::DrawCommand> cmds;
 
@@ -266,6 +412,10 @@ void renderCleanHudOverlay() noexcept {
         crosshairVertical.color = 0xFFFFFFFF;
         crosshairVertical.size = 2.0f;
         cmds.push_back(crosshairVertical);
+
+        getProfiler().recordRendered(2);
+    } else {
+        getProfiler().recordSkipped(2);
     }
 
     // Clean HUD Mode Status Indicator
@@ -278,9 +428,23 @@ void renderCleanHudOverlay() noexcept {
         textCmd.size = 14.0f;
         textCmd.text = "HUD Opt [Clean Mode]";
         cmds.push_back(textCmd);
+        getProfiler().recordRendered(1);
+    }
+
+    // Performance Debug Profiler Info
+    if (getConfig().showProfiler.load(std::memory_order_relaxed)) {
+        pl::modmenu::DrawCommand profilerCmd{};
+        profilerCmd.type = pl::modmenu::DrawCommandType::Text;
+        profilerCmd.x = 10.0f;
+        profilerCmd.y = 30.0f;
+        profilerCmd.color = 0xFFFFFF00;
+        profilerCmd.size = 12.0f;
+        profilerCmd.text = getProfiler().formatDebugInfo();
+        cmds.push_back(profilerCmd);
     }
 
     pl::modmenu::submitDrawCommands("hud_optimizer_module", cmds);
+    getProfiler().endFrame();
 }
 
 // ============================================================================
@@ -336,16 +500,12 @@ void uninstallHooks() noexcept {
 } // namespace Hooks
 
 // ============================================================================
-// Frame Lifecycle & Global State Management
+// Global State Management
 // ============================================================================
-
-void beginFrame() noexcept {
-    getMetrics().totalFrames.fetch_add(1, std::memory_order_relaxed);
-}
 
 void invalidateAllCaches() noexcept {
     getHotbarCache().invalidate();
-    getCameraSmoother().reset();
+    getTextCache().clear();
 }
 
 } // namespace HUDOptimizer
@@ -365,19 +525,22 @@ private:
 
         // Register ModMenu Builder
         ModuleBuilder builder("hud_optimizer_module", "HUD Optimizer");
-        builder.description("Smart, lightweight HUD optimization engine reducing redundant Bedrock rendering overhead with camera smoothing and VSync toggles.")
+        builder.description("High-performance HUD optimization engine for Bedrock with adaptive performance mode, presets, and VSync control.")
                .modId("hud_optimizer")
                .defaultEnabled(true)
                .hideInHudEditor(false)
                .config("enabled", "Enable Optimizer Engine", ConfigType::Toggle, cfg.enabled.load() ? "true" : "false")
+               .config("preset", "Performance Preset", ConfigType::SliderInt, std::to_string(cfg.preset.load()), "0", "3")
+               .config("adaptive_mode", "Adaptive Performance Mode", ConfigType::Toggle, cfg.adaptiveMode.load() ? "true" : "false")
                .config("clean_hud", "Clean HUD Mode", ConfigType::Toggle, cfg.cleanHudMode.load() ? "true" : "false")
                .config("cache_hotbar", "Cache Hotbar Slots", ConfigType::Toggle, cfg.cacheHotbar.load() ? "true" : "false")
                .config("cache_vitals", "Cache Health/Hunger/Armor/XP", ConfigType::Toggle, cfg.cacheVitals.load() ? "true" : "false")
-               .config("camera_smoothing", "Smooth Camera Turning", ConfigType::Toggle, cfg.cameraSmoothing.load() ? "true" : "false")
+               .config("cache_text", "Cache UI Text Layouts", ConfigType::Toggle, cfg.cacheText.load() ? "true" : "false")
                .config("disable_vsync", "Disable VSync (Max FPS)", ConfigType::Toggle, cfg.disableVsync.load() ? "true" : "false")
                .config("disable_animations", "Disable Cosmetic Animations", ConfigType::Toggle, cfg.disableAnimations.load() ? "true" : "false")
                .config("simplify_crosshair", "Simplify Crosshair", ConfigType::Toggle, cfg.simplifyCrosshair.load() ? "true" : "false")
                .config("reduce_transparency", "Reduce Layers & Transparency", ConfigType::Toggle, cfg.reduceTransparency.load() ? "true" : "false")
+               .config("show_profiler", "Show Profiler Info", ConfigType::Toggle, cfg.showProfiler.load() ? "true" : "false")
                .onToggle([this](std::string_view moduleId, bool enabled) {
                    HUDOptimizer::getConfig().enabled.store(enabled, std::memory_order_relaxed);
                    HUDOptimizer::invalidateAllCaches();
@@ -389,14 +552,21 @@ private:
 
                    if (key == "enabled") {
                        cfgState.enabled.store(boolVal, std::memory_order_relaxed);
+                   } else if (key == "preset") {
+                       try {
+                           int presetVal = std::stoi(std::string(value));
+                           HUDOptimizer::applyPreset(static_cast<HUDOptimizer::PerformancePreset>(presetVal));
+                       } catch (...) {}
+                   } else if (key == "adaptive_mode") {
+                       cfgState.adaptiveMode.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "clean_hud") {
                        cfgState.cleanHudMode.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "cache_hotbar") {
                        cfgState.cacheHotbar.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "cache_vitals") {
                        cfgState.cacheVitals.store(boolVal, std::memory_order_relaxed);
-                   } else if (key == "camera_smoothing") {
-                       cfgState.cameraSmoothing.store(boolVal, std::memory_order_relaxed);
+                   } else if (key == "cache_text") {
+                       cfgState.cacheText.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "disable_vsync") {
                        cfgState.disableVsync.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "disable_animations") {
@@ -405,6 +575,8 @@ private:
                        cfgState.simplifyCrosshair.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "reduce_transparency") {
                        cfgState.reduceTransparency.store(boolVal, std::memory_order_relaxed);
+                   } else if (key == "show_profiler") {
+                       cfgState.showProfiler.store(boolVal, std::memory_order_relaxed);
                    }
 
                    HUDOptimizer::invalidateAllCaches();
