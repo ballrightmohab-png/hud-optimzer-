@@ -1,16 +1,8 @@
 {
-  "format_version": 1,
-  "id": "hud_optimizer",
+  "type": "preload-native",
   "name": "HUD Optimizer",
-  "version": [1, 0, 0],
-  "description": "Smart HUD rendering optimizer reducing redundant draw calls for Minecraft Bedrock on LeviLaunchroid.",
-  "authors": ["Developer"],
-  "type": "native",
-  "entry": "libhud_optimizer.so",
-  "dependencies": [
-    {
-      "name": "minecraft",
-      "version": ">=1.26.45 <=1.26.52"
-    }
-  ]
+  "author": "Developer",
+  "description": "Smart HUD rendering optimizer for Minecraft Bedrock on LeviLaunchroid.",
+  "version": "1.0.0",
+  "entry": "libhud_optimizer.so"
 }

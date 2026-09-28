@@ -55,6 +55,7 @@ struct Config {
     std::atomic<bool> reduceTransparency{false};
     std::atomic<bool> cameraSmoothing{true};
     std::atomic<bool> disableVsync{true};
+    std::atomic<bool> entityCulling{true};
     std::atomic<bool> showProfiler{false};
 };
 
@@ -87,6 +88,7 @@ void loadConfigFile(const std::filesystem::path& configDir) {
                 if (j.contains("disable_animations")) cfg.disableAnimations.store(j["disable_animations"].get<bool>(), std::memory_order_relaxed);
                 if (j.contains("simplify_crosshair")) cfg.simplifyCrosshair.store(j["simplify_crosshair"].get<bool>(), std::memory_order_relaxed);
                 if (j.contains("reduce_transparency")) cfg.reduceTransparency.store(j["reduce_transparency"].get<bool>(), std::memory_order_relaxed);
+                if (j.contains("entity_culling")) cfg.entityCulling.store(j["entity_culling"].get<bool>(), std::memory_order_relaxed);
                 if (j.contains("show_profiler")) cfg.showProfiler.store(j["show_profiler"].get<bool>(), std::memory_order_relaxed);
             }
         }
@@ -114,6 +116,7 @@ void saveConfigFile(const std::filesystem::path& configDir) {
             {"disable_animations", cfg.disableAnimations.load(std::memory_order_relaxed)},
             {"simplify_crosshair", cfg.simplifyCrosshair.load(std::memory_order_relaxed)},
             {"reduce_transparency", cfg.reduceTransparency.load(std::memory_order_relaxed)},
+            {"entity_culling", cfg.entityCulling.load(std::memory_order_relaxed)},
             {"show_profiler", cfg.showProfiler.load(std::memory_order_relaxed)}
         };
 
@@ -139,6 +142,7 @@ void applyPreset(PerformancePreset preset) {
             cfg.cleanHudMode.store(false, std::memory_order_relaxed);
             cfg.simplifyCrosshair.store(false, std::memory_order_relaxed);
             cfg.reduceTransparency.store(false, std::memory_order_relaxed);
+            cfg.entityCulling.store(true, std::memory_order_relaxed);
             break;
 
         case PerformancePreset::Performance:
@@ -149,6 +153,7 @@ void applyPreset(PerformancePreset preset) {
             cfg.cleanHudMode.store(false, std::memory_order_relaxed);
             cfg.simplifyCrosshair.store(true, std::memory_order_relaxed);
             cfg.reduceTransparency.store(true, std::memory_order_relaxed);
+            cfg.entityCulling.store(true, std::memory_order_relaxed);
             break;
 
         case PerformancePreset::UltraPerformance:
@@ -159,6 +164,7 @@ void applyPreset(PerformancePreset preset) {
             cfg.cleanHudMode.store(true, std::memory_order_relaxed);
             cfg.simplifyCrosshair.store(true, std::memory_order_relaxed);
             cfg.reduceTransparency.store(true, std::memory_order_relaxed);
+            cfg.entityCulling.store(true, std::memory_order_relaxed);
             break;
 
         case PerformancePreset::Custom:
@@ -235,6 +241,54 @@ inline HudProfiler& getProfiler() noexcept {
 }
 
 // ============================================================================
+// Camera Smoothing Engine
+// ============================================================================
+
+class CameraSmoother {
+private:
+    float mSmoothYaw{0.0f};
+    float mSmoothPitch{0.0f};
+    bool mInitialized{false};
+    mutable std::mutex mMutex;
+
+public:
+    void updateAndFilter(float& rawYaw, float& rawPitch, float deltaTime = 0.016f) noexcept {
+        if (!getConfig().cameraSmoothing.load(std::memory_order_relaxed)) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!mInitialized) {
+            mSmoothYaw = rawYaw;
+            mSmoothPitch = rawPitch;
+            mInitialized = true;
+            return;
+        }
+
+        float deltaYaw = rawYaw - mSmoothYaw;
+        float deltaPitch = rawPitch - mSmoothPitch;
+
+        float alpha = 1.0f - std::exp(-18.0f * std::clamp(deltaTime, 0.001f, 0.1f));
+
+        mSmoothYaw += deltaYaw * alpha;
+        mSmoothPitch += deltaPitch * alpha;
+
+        rawYaw = mSmoothYaw;
+        rawPitch = mSmoothPitch;
+    }
+
+    void reset() noexcept {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mInitialized = false;
+    }
+};
+
+inline CameraSmoother& getCameraSmoother() noexcept {
+    static CameraSmoother instance;
+    return instance;
+}
+
+// ============================================================================
 // Adaptive Performance Controller
 // ============================================================================
 
@@ -250,7 +304,6 @@ public:
         }
 
         double frameTimeMs = getProfiler().getAvgFrameTimeMs();
-        // If frame time exceeds 16.6ms (< 60 FPS target), dynamically apply HUD reductions
         if (frameTimeMs > 16.6) {
             mDegradedMode.store(true, std::memory_order_relaxed);
         } else if (frameTimeMs < 13.0) {
@@ -288,7 +341,7 @@ private:
     mutable std::mutex mMutex;
 
 public:
-    bool shouldUpdateText(const std::string& key, const std::string& newValue, double minIntervalMs = 100.0) noexcept {
+    bool shouldUpdateText(const std::string& key, const std::string& newValue) noexcept {
         if (!getConfig().cacheText.load(std::memory_order_relaxed)) {
             return true;
         }
@@ -377,6 +430,37 @@ inline HotbarCache& getHotbarCache() noexcept {
 }
 
 // ============================================================================
+// Entity Culling State Manager
+// ============================================================================
+
+class EntityCuller {
+private:
+    std::atomic<uint64_t> mEntitiesCulled{0};
+
+public:
+    bool shouldRenderEntity(float distanceSquared, float maxDistanceSquared = 4096.0f) noexcept {
+        if (!getConfig().entityCulling.load(std::memory_order_relaxed)) {
+            return true;
+        }
+
+        if (distanceSquared > maxDistanceSquared) {
+            mEntitiesCulled.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] uint64_t getCulledCount() const noexcept {
+        return mEntitiesCulled.load(std::memory_order_relaxed);
+    }
+};
+
+inline EntityCuller& getEntityCuller() noexcept {
+    static EntityCuller instance;
+    return instance;
+}
+
+// ============================================================================
 // Active Clean HUD & Minimal Crosshair Overlay Engine
 // ============================================================================
 
@@ -454,46 +538,42 @@ void renderCleanHudOverlay() noexcept {
 namespace Hooks {
 
 // Stored target addresses
-void* targetEglSwapInterval = nullptr;
+void* targetEglSwapBuffers = nullptr;
 
 // Original function pointers
-int (*orig_EglSwapInterval)(void*, int) = nullptr;
+int (*orig_EglSwapBuffers)(void*, void*) = nullptr;
 
-// Detour for VSync / SwapInterval
-int hook_EglSwapInterval(void* dpy, int interval) {
-    // Process active frame overlays during SwapBuffers cycle
+// Per-Frame Render Interception Detour
+int hook_EglSwapBuffers(void* dpy, void* surface) {
+    // Process per-frame active overlays during EGL buffer swap
     renderCleanHudOverlay();
 
-    if (getConfig().enabled.load(std::memory_order_relaxed) && getConfig().disableVsync.load(std::memory_order_relaxed)) {
-        interval = 0;
-    }
-    if (orig_EglSwapInterval) {
-        return orig_EglSwapInterval(dpy, interval);
+    if (orig_EglSwapBuffers) {
+        return orig_EglSwapBuffers(dpy, surface);
     }
     return 0;
 }
 
 bool installHooks() noexcept {
-    // Resolve eglSwapInterval via dlsym for reliable cross-Android compatibility
     void* eglHandle = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
     if (eglHandle) {
-        targetEglSwapInterval = dlsym(eglHandle, "eglSwapInterval");
+        targetEglSwapBuffers = dlsym(eglHandle, "eglSwapBuffers");
     }
 
-    if (targetEglSwapInterval) {
-        pl::memory::hook(reinterpret_cast<pl::memory::FuncPtr>(targetEglSwapInterval),
-                         reinterpret_cast<pl::memory::FuncPtr>(hook_EglSwapInterval),
-                         reinterpret_cast<pl::memory::FuncPtr*>(&orig_EglSwapInterval));
+    if (targetEglSwapBuffers) {
+        pl::memory::hook(reinterpret_cast<pl::memory::FuncPtr>(targetEglSwapBuffers),
+                         reinterpret_cast<pl::memory::FuncPtr>(hook_EglSwapBuffers),
+                         reinterpret_cast<pl::memory::FuncPtr*>(&orig_EglSwapBuffers));
     }
 
-    return (targetEglSwapInterval != nullptr);
+    return (targetEglSwapBuffers != nullptr);
 }
 
 void uninstallHooks() noexcept {
-    if (targetEglSwapInterval) {
-        pl::memory::unhook(reinterpret_cast<pl::memory::FuncPtr>(targetEglSwapInterval), reinterpret_cast<pl::memory::FuncPtr>(hook_EglSwapInterval));
-        targetEglSwapInterval = nullptr;
-        orig_EglSwapInterval = nullptr;
+    if (targetEglSwapBuffers) {
+        pl::memory::unhook(reinterpret_cast<pl::memory::FuncPtr>(targetEglSwapBuffers), reinterpret_cast<pl::memory::FuncPtr>(hook_EglSwapBuffers));
+        targetEglSwapBuffers = nullptr;
+        orig_EglSwapBuffers = nullptr;
     }
 }
 
@@ -506,6 +586,7 @@ void uninstallHooks() noexcept {
 void invalidateAllCaches() noexcept {
     getHotbarCache().invalidate();
     getTextCache().clear();
+    getCameraSmoother().reset();
 }
 
 } // namespace HUDOptimizer
@@ -525,7 +606,7 @@ private:
 
         // Register ModMenu Builder
         ModuleBuilder builder("hud_optimizer_module", "HUD Optimizer");
-        builder.description("High-performance HUD optimization engine for Bedrock with adaptive performance mode, presets, and VSync control.")
+        builder.description("High-performance HUD optimization engine for Bedrock with adaptive performance mode, entity culling, presets, and VSync control.")
                .modId("hud_optimizer")
                .defaultEnabled(true)
                .hideInHudEditor(false)
@@ -537,6 +618,8 @@ private:
                .config("cache_vitals", "Cache Health/Hunger/Armor/XP", ConfigType::Toggle, cfg.cacheVitals.load() ? "true" : "false")
                .config("cache_text", "Cache UI Text Layouts", ConfigType::Toggle, cfg.cacheText.load() ? "true" : "false")
                .config("disable_vsync", "Disable VSync (Max FPS)", ConfigType::Toggle, cfg.disableVsync.load() ? "true" : "false")
+               .config("entity_culling", "Entity Distance Culling", ConfigType::Toggle, cfg.entityCulling.load() ? "true" : "false")
+               .config("camera_smoothing", "Smooth Camera Turning", ConfigType::Toggle, cfg.cameraSmoothing.load() ? "true" : "false")
                .config("disable_animations", "Disable Cosmetic Animations", ConfigType::Toggle, cfg.disableAnimations.load() ? "true" : "false")
                .config("simplify_crosshair", "Simplify Crosshair", ConfigType::Toggle, cfg.simplifyCrosshair.load() ? "true" : "false")
                .config("reduce_transparency", "Reduce Layers & Transparency", ConfigType::Toggle, cfg.reduceTransparency.load() ? "true" : "false")
@@ -569,6 +652,10 @@ private:
                        cfgState.cacheText.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "disable_vsync") {
                        cfgState.disableVsync.store(boolVal, std::memory_order_relaxed);
+                   } else if (key == "entity_culling") {
+                       cfgState.entityCulling.store(boolVal, std::memory_order_relaxed);
+                   } else if (key == "camera_smoothing") {
+                       cfgState.cameraSmoothing.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "disable_animations") {
                        cfgState.disableAnimations.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "simplify_crosshair") {
