@@ -1,4 +1,4 @@
-// HUDOptimizer.cpp - Optimized HUD Rendering Module for Minecraft Bedrock on LeviLaunchroid
+// HUDOptimizer.cpp - Camera Smoothing + TFR + HUD Optimization Module for Minecraft Bedrock on LeviLaunchroid
 // Architecture: Native C++20 module targeting Android ARM64
 
 #include <algorithm>
@@ -17,6 +17,9 @@
 #include <pl/memory/Hook.hpp>
 #include <pl/memory/Signature.hpp>
 
+#include "CameraSmoothing.hpp"
+#include "TFREngine.hpp"
+
 namespace HUDOptimizer {
 
 // ============================================================================
@@ -31,6 +34,15 @@ struct Config {
     std::atomic<bool> disableAnimations{true};
     std::atomic<bool> simplifyCrosshair{false};
     std::atomic<bool> reduceTransparency{false};
+
+    // Camera Smoothing Controls
+    std::atomic<bool> cameraSmoothingEnabled{true};
+    std::atomic<float> cameraSmoothness{12.0f};
+
+    // TFR Frame Generation Controls
+    std::atomic<bool> tfrEnabled{true};
+    std::atomic<TFR::TFRMode> tfrMode{TFR::TFRMode::AUTO};
+    std::atomic<bool> preserveHUDInTFR{true};
 };
 
 inline Config& getConfig() noexcept {
@@ -44,12 +56,14 @@ inline Config& getConfig() noexcept {
 
 struct PerformanceMetrics {
     std::atomic<uint64_t> totalFrames{0};
+    std::atomic<uint64_t> generatedFrames{0};
     std::atomic<uint64_t> cachedHits{0};
     std::atomic<uint64_t> hotbarBypasses{0};
     std::atomic<uint64_t> vitalBypasses{0};
 
     void reset() noexcept {
         totalFrames.store(0);
+        generatedFrames.store(0);
         cachedHits.store(0);
         hotbarBypasses.store(0);
         vitalBypasses.store(0);
@@ -209,7 +223,7 @@ inline VitalsCache& getVitalsCache() noexcept {
 }
 
 // ============================================================================
-// Bedrock UI Detours & Interception Hooks
+// Bedrock Native Detours & Interception Hooks
 // ============================================================================
 
 namespace Hooks {
@@ -217,6 +231,20 @@ namespace Hooks {
 // Original function pointers
 void (*orig_HudElementRender)(void*, void*) = nullptr;
 void (*orig_HotbarRenderSlot)(void*, int, void*) = nullptr;
+void (*orig_MouseRawInput)(void*, float, float) = nullptr;
+void (*orig_RenderWorld)(void*, float) = nullptr;
+
+// Detour for raw input updates -> Target Camera rotation immediately updated with zero latency
+void hook_MouseRawInput(void* self, float deltaX, float deltaY) {
+    if (getConfig().cameraSmoothingEnabled.load(std::memory_order_relaxed)) {
+        // Raw mouse/touch movement directly feeds target camera
+        CameraSystem::getCameraEngine().updateRawInputDelta(deltaX, deltaY);
+    }
+
+    if (orig_MouseRawInput) {
+        orig_MouseRawInput(self, deltaX, deltaY);
+    }
+}
 
 // Detour for general HUD element rendering
 void hook_HudElementRender(void* self, void* ctx) {
@@ -227,7 +255,6 @@ void hook_HudElementRender(void* self, void* ctx) {
 
     getMetrics().totalFrames.fetch_add(1, std::memory_order_relaxed);
 
-    // Call original render method
     if (orig_HudElementRender) {
         orig_HudElementRender(self, ctx);
     }
@@ -242,10 +269,8 @@ void hook_HotbarRenderSlot(void* self, int slotIndex, void* slotData) {
         return;
     }
 
-    // Dynamic slot state check
     SlotState currentSlotState{};
     if (slotData) {
-        // Safe access to item structure properties
         std::memcpy(&currentSlotState, slotData, std::min(sizeof(SlotState), sizeof(uint64_t) * 2));
     }
 
@@ -254,33 +279,71 @@ void hook_HotbarRenderSlot(void* self, int slotIndex, void* slotData) {
     }
 }
 
+// Detour for World Rendering pass: Integrates Camera Smoothing and TFR Temporal Generation
+void hook_RenderWorld(void* self, float dt) {
+    // 1. Update Camera Smoothing and apply to visual camera context
+    CameraSystem::CameraSmoothingEngine::State camState{};
+    if (getConfig().cameraSmoothingEnabled.load(std::memory_order_relaxed)) {
+        camState = CameraSystem::getCameraEngine().updateVisualCamera(dt);
+        CameraSystem::getCameraEngine().applyToCameraContext(self, camState.renderedYaw, camState.renderedPitch);
+    }
+
+    // 2. TFR Temporal Frame Recording & Generation pipeline
+    if (getConfig().tfrEnabled.load(std::memory_order_relaxed)) {
+        TFR::FrameMetadata frameMeta{};
+        frameMeta.frameIndex = getMetrics().totalFrames.load(std::memory_order_relaxed);
+        frameMeta.cameraYaw = camState.renderedYaw;
+        frameMeta.cameraPitch = camState.renderedPitch;
+
+        TFR::getTFREngine().recordRealFrame(frameMeta, dt);
+
+        if (TFR::getTFREngine().shouldGenerateFrame()) {
+            // Reconstruct and present intermediate frame G0.5 to render pipeline
+            TFR::getTFREngine().renderAndPresentGeneratedFrame(self, 0.5f);
+            getMetrics().generatedFrames.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    if (orig_RenderWorld) {
+        orig_RenderWorld(self, dt);
+    }
+}
+
 bool installHooks() noexcept {
-    // Resolve signatures dynamically in libminecraftpe.so with standard fallback safety
     uintptr_t hudRenderAddr = pl::memory::resolveSignature("48 89 5C 24 ?? 57 48 83 EC ?? 48 8B D9", "libminecraftpe.so");
     uintptr_t hotbarSlotAddr = pl::memory::resolveSignature("40 53 48 83 EC ?? 48 8B D9 89 54 24", "libminecraftpe.so");
+    uintptr_t rawInputAddr = pl::memory::resolveSignature("0F 29 74 24 ?? 0F 28 F2 48 8B F1", "libminecraftpe.so");
+    uintptr_t renderWorldAddr = pl::memory::resolveSignature("48 8B C4 48 89 58 08 48 89 6C 24 10", "libminecraftpe.so");
 
     bool success = true;
     if (hudRenderAddr) {
         pl::memory::hook(reinterpret_cast<pl::memory::FuncPtr>(hudRenderAddr),
                          reinterpret_cast<pl::memory::FuncPtr>(hook_HudElementRender),
                          reinterpret_cast<pl::memory::FuncPtr*>(&orig_HudElementRender));
-    } else {
-        success = false;
-    }
+    } else success = false;
 
     if (hotbarSlotAddr) {
         pl::memory::hook(reinterpret_cast<pl::memory::FuncPtr>(hotbarSlotAddr),
                          reinterpret_cast<pl::memory::FuncPtr>(hook_HotbarRenderSlot),
                          reinterpret_cast<pl::memory::FuncPtr*>(&orig_HotbarRenderSlot));
-    } else {
-        success = false;
+    } else success = false;
+
+    if (rawInputAddr) {
+        pl::memory::hook(reinterpret_cast<pl::memory::FuncPtr>(rawInputAddr),
+                         reinterpret_cast<pl::memory::FuncPtr>(hook_MouseRawInput),
+                         reinterpret_cast<pl::memory::FuncPtr*>(&orig_MouseRawInput));
+    }
+
+    if (renderWorldAddr) {
+        pl::memory::hook(reinterpret_cast<pl::memory::FuncPtr>(renderWorldAddr),
+                         reinterpret_cast<pl::memory::FuncPtr>(hook_RenderWorld),
+                         reinterpret_cast<pl::memory::FuncPtr*>(&orig_RenderWorld));
     }
 
     return success;
 }
 
 void uninstallHooks() noexcept {
-    // Unhook safely when disabling
     if (orig_HudElementRender) {
         pl::memory::unhook(reinterpret_cast<pl::memory::FuncPtr>(hook_HudElementRender), reinterpret_cast<pl::memory::FuncPtr>(hook_HudElementRender));
         orig_HudElementRender = nullptr;
@@ -288,6 +351,14 @@ void uninstallHooks() noexcept {
     if (orig_HotbarRenderSlot) {
         pl::memory::unhook(reinterpret_cast<pl::memory::FuncPtr>(hook_HotbarRenderSlot), reinterpret_cast<pl::memory::FuncPtr>(hook_HotbarRenderSlot));
         orig_HotbarRenderSlot = nullptr;
+    }
+    if (orig_MouseRawInput) {
+        pl::memory::unhook(reinterpret_cast<pl::memory::FuncPtr>(hook_MouseRawInput), reinterpret_cast<pl::memory::FuncPtr>(hook_MouseRawInput));
+        orig_MouseRawInput = nullptr;
+    }
+    if (orig_RenderWorld) {
+        pl::memory::unhook(reinterpret_cast<pl::memory::FuncPtr>(hook_RenderWorld), reinterpret_cast<pl::memory::FuncPtr>(hook_RenderWorld));
+        orig_RenderWorld = nullptr;
     }
 }
 
@@ -319,18 +390,19 @@ private:
     void registerModMenuControls() {
         using namespace pl::modmenu;
 
-        // Register ModMenu Builder
-        ModuleBuilder builder("hud_optimizer_module", "HUD Optimizer");
-        builder.description("Smart, lightweight HUD optimization engine reducing redundant Bedrock rendering overhead.")
+        ModuleBuilder builder("hud_optimizer_module", "HUD Optimizer & TFR Engine");
+        builder.description("Smart HUD optimization, Camera Smoothing, and Temporal Frame Reconstruction (TFR) engine.")
                .modId("hud_optimizer")
                .defaultEnabled(true)
                .hideInHudEditor(false)
                .config("clean_hud", "Clean HUD Mode", ConfigType::Toggle, "false")
                .config("cache_hotbar", "Cache Hotbar Slots", ConfigType::Toggle, "true")
                .config("cache_vitals", "Cache Health/Hunger/Armor/XP", ConfigType::Toggle, "true")
-               .config("disable_animations", "Disable Cosmetic Animations", ConfigType::Toggle, "true")
-               .config("simplify_crosshair", "Simplify Crosshair", ConfigType::Toggle, "false")
-               .config("reduce_transparency", "Reduce Layers & Transparency", ConfigType::Toggle, "false")
+               .config("camera_smoothing", "Enable Camera Smoothing", ConfigType::Toggle, "true")
+               .config("camera_smoothness", "Camera Smoothness Factor", ConfigType::Slider, "12.0")
+               .config("tfr_enabled", "Enable Temporal Frame Reconstruction (TFR)", ConfigType::Toggle, "true")
+               .config("tfr_mode", "TFR Mode (0=Off, 1=1x, 2=2x, 3=Auto)", ConfigType::Slider, "3")
+               .config("preserve_hud_tfr", "Preserve HUD Crispness in TFR", ConfigType::Toggle, "true")
                .onToggle([](std::string_view moduleId, bool enabled) {
                    HUDOptimizer::getConfig().enabled.store(enabled, std::memory_order_relaxed);
                    HUDOptimizer::invalidateAllCaches();
@@ -345,19 +417,31 @@ private:
                        cfg.cacheHotbar.store(boolVal, std::memory_order_relaxed);
                    } else if (key == "cache_vitals") {
                        cfg.cacheVitals.store(boolVal, std::memory_order_relaxed);
-                   } else if (key == "disable_animations") {
-                       cfg.disableAnimations.store(boolVal, std::memory_order_relaxed);
-                   } else if (key == "simplify_crosshair") {
-                       cfg.simplifyCrosshair.store(boolVal, std::memory_order_relaxed);
-                   } else if (key == "reduce_transparency") {
-                       cfg.reduceTransparency.store(boolVal, std::memory_order_relaxed);
+                   } else if (key == "camera_smoothing") {
+                       cfg.cameraSmoothingEnabled.store(boolVal, std::memory_order_relaxed);
+                       CameraSystem::getCameraEngine().setEnabled(boolVal);
+                   } else if (key == "camera_smoothness") {
+                       float smoothness = std::strtof(value.data(), nullptr);
+                       cfg.cameraSmoothness.store(smoothness, std::memory_order_relaxed);
+                       CameraSystem::getCameraEngine().setSmoothness(smoothness);
+                   } else if (key == "tfr_enabled") {
+                       cfg.tfrEnabled.store(boolVal, std::memory_order_relaxed);
+                       TFR::getTFREngine().setEnabled(boolVal);
+                   } else if (key == "tfr_mode") {
+                       int modeVal = std::atoi(value.data());
+                       TFR::TFRMode mode = static_cast<TFR::TFRMode>(modeVal);
+                       cfg.tfrMode.store(mode, std::memory_order_relaxed);
+                       TFR::getTFREngine().setMode(mode);
+                   } else if (key == "preserve_hud_tfr") {
+                       cfg.preserveHUDInTFR.store(boolVal, std::memory_order_relaxed);
+                       TFR::getTFREngine().setHUDPreservation(boolVal);
                    }
 
                    HUDOptimizer::invalidateAllCaches();
                });
 
         if (builder.registerModule()) {
-            mSelf.getLogger().info("HUD Optimizer ModMenu module registered successfully.");
+            mSelf.getLogger().info("HUD Optimizer & TFR Engine ModMenu module registered successfully.");
         } else {
             mSelf.getLogger().warn("Failed to register HUD Optimizer ModMenu module.");
         }
@@ -372,29 +456,29 @@ public:
     HUDOptimizerMod() : mSelf(*ll::mod::NativeMod::current()) {}
 
     bool load() noexcept {
-        mSelf.getLogger().info("Loading HUD Optimizer Native Engine...");
+        mSelf.getLogger().info("Loading HUD Optimizer & TFR Native Engine...");
         return true;
     }
 
     bool enable() noexcept {
-        mSelf.getLogger().info("Enabling HUD Optimizer...");
+        mSelf.getLogger().info("Enabling HUD Optimizer & TFR Engine...");
         HUDOptimizer::getConfig().enabled.store(true, std::memory_order_relaxed);
         HUDOptimizer::invalidateAllCaches();
 
         bool hooksInstalled = HUDOptimizer::Hooks::installHooks();
         if (hooksInstalled) {
-            mSelf.getLogger().info("Native HUD interception hooks installed successfully.");
+            mSelf.getLogger().info("Native HUD & Render interception hooks installed successfully.");
         } else {
-            mSelf.getLogger().warn("Native HUD hooks partially or not installed; operating in safe mode.");
+            mSelf.getLogger().warn("Native HUD hooks partially installed; operating in safe mode.");
         }
 
         registerModMenuControls();
-        mSelf.getLogger().info("HUD Optimizer enabled successfully!");
+        mSelf.getLogger().info("HUD Optimizer & TFR Engine enabled successfully!");
         return true;
     }
 
     bool disable() noexcept {
-        mSelf.getLogger().info("Disabling HUD Optimizer...");
+        mSelf.getLogger().info("Disabling HUD Optimizer & TFR Engine...");
         HUDOptimizer::getConfig().enabled.store(false, std::memory_order_relaxed);
         HUDOptimizer::invalidateAllCaches();
         HUDOptimizer::Hooks::uninstallHooks();
