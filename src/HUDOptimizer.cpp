@@ -377,6 +377,50 @@ void invalidateAllCaches() noexcept {
     getVitalsCache().invalidate();
 }
 
+static void handleToggleCallback(std::string_view moduleId, bool enabled) {
+    getConfig().enabled.store(enabled, std::memory_order_relaxed);
+    invalidateAllCaches();
+}
+
+static void handleConfigChangedCallback(std::string_view moduleId, std::string_view key, std::string_view value) {
+    auto& cfg = getConfig();
+    bool boolVal = (value == "true" || value == "1");
+
+    if (key == "clean_hud") {
+        cfg.cleanHudMode.store(boolVal, std::memory_order_relaxed);
+    } else if (key == "cache_hotbar") {
+        cfg.cacheHotbar.store(boolVal, std::memory_order_relaxed);
+    } else if (key == "cache_vitals") {
+        cfg.cacheVitals.store(boolVal, std::memory_order_relaxed);
+    } else if (key == "camera_smoothing") {
+        cfg.cameraSmoothingEnabled.store(boolVal, std::memory_order_relaxed);
+        CameraSystem::getCameraEngine().setEnabled(boolVal);
+    } else if (key == "camera_smoothness") {
+        std::string valStr(value);
+        try {
+            float smoothness = std::stof(valStr);
+            cfg.cameraSmoothness.store(smoothness, std::memory_order_relaxed);
+            CameraSystem::getCameraEngine().setSmoothness(smoothness);
+        } catch (...) {}
+    } else if (key == "tfr_enabled") {
+        cfg.tfrEnabled.store(boolVal, std::memory_order_relaxed);
+        TFR::getTFREngine().setEnabled(boolVal);
+    } else if (key == "tfr_mode") {
+        std::string valStr(value);
+        try {
+            int modeVal = std::stoi(valStr);
+            TFR::TFRMode mode = static_cast<TFR::TFRMode>(modeVal);
+            cfg.tfrMode.store(mode, std::memory_order_relaxed);
+            TFR::getTFREngine().setMode(mode);
+        } catch (...) {}
+    } else if (key == "preserve_hud_tfr") {
+        cfg.preserveHUDInTFR.store(boolVal, std::memory_order_relaxed);
+        TFR::getTFREngine().setHUDPreservation(boolVal);
+    }
+
+    invalidateAllCaches();
+}
+
 } // namespace HUDOptimizer
 
 // ============================================================================
@@ -403,48 +447,8 @@ private:
                .config("tfr_enabled", "Enable Temporal Frame Reconstruction (TFR)", ConfigType::Toggle, "true")
                .config("tfr_mode", "TFR Mode (0=Off, 1=1x, 2=2x, 3=Auto)", ConfigType::Slider, "3")
                .config("preserve_hud_tfr", "Preserve HUD Crispness in TFR", ConfigType::Toggle, "true")
-               .onToggle([](std::string_view moduleId, bool enabled) {
-                   HUDOptimizer::getConfig().enabled.store(enabled, std::memory_order_relaxed);
-                   HUDOptimizer::invalidateAllCaches();
-               })
-               .onConfigChanged([](std::string_view moduleId, std::string_view key, std::string_view value) {
-                   auto& cfg = HUDOptimizer::getConfig();
-                   bool boolVal = (value == "true" || value == "1");
-
-                   if (key == "clean_hud") {
-                       cfg.cleanHudMode.store(boolVal, std::memory_order_relaxed);
-                   } else if (key == "cache_hotbar") {
-                       cfg.cacheHotbar.store(boolVal, std::memory_order_relaxed);
-                   } else if (key == "cache_vitals") {
-                       cfg.cacheVitals.store(boolVal, std::memory_order_relaxed);
-                   } else if (key == "camera_smoothing") {
-                       cfg.cameraSmoothingEnabled.store(boolVal, std::memory_order_relaxed);
-                       CameraSystem::getCameraEngine().setEnabled(boolVal);
-                   } else if (key == "camera_smoothness") {
-                       std::string valStr(value);
-                       try {
-                           float smoothness = std::stof(valStr);
-                           cfg.cameraSmoothness.store(smoothness, std::memory_order_relaxed);
-                           CameraSystem::getCameraEngine().setSmoothness(smoothness);
-                       } catch (...) {}
-                   } else if (key == "tfr_enabled") {
-                       cfg.tfrEnabled.store(boolVal, std::memory_order_relaxed);
-                       TFR::getTFREngine().setEnabled(boolVal);
-                   } else if (key == "tfr_mode") {
-                       std::string valStr(value);
-                       try {
-                           int modeVal = std::stoi(valStr);
-                           TFR::TFRMode mode = static_cast<TFR::TFRMode>(modeVal);
-                           cfg.tfrMode.store(mode, std::memory_order_relaxed);
-                           TFR::getTFREngine().setMode(mode);
-                       } catch (...) {}
-                   } else if (key == "preserve_hud_tfr") {
-                       cfg.preserveHUDInTFR.store(boolVal, std::memory_order_relaxed);
-                       TFR::getTFREngine().setHUDPreservation(boolVal);
-                   }
-
-                   HUDOptimizer::invalidateAllCaches();
-               });
+               .onToggle(&HUDOptimizer::handleToggleCallback)
+               .onConfigChanged(&HUDOptimizer::handleConfigChangedCallback);
 
         if (builder.registerModule()) {
             mSelf.getLogger().info("HUD Optimizer & TFR Engine ModMenu module registered successfully.");
