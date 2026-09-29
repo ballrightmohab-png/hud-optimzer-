@@ -421,17 +421,23 @@ private:
                        cfg.cameraSmoothingEnabled.store(boolVal, std::memory_order_relaxed);
                        CameraSystem::getCameraEngine().setEnabled(boolVal);
                    } else if (key == "camera_smoothness") {
-                       float smoothness = std::strtof(value.data(), nullptr);
-                       cfg.cameraSmoothness.store(smoothness, std::memory_order_relaxed);
-                       CameraSystem::getCameraEngine().setSmoothness(smoothness);
+                       std::string valStr(value);
+                       try {
+                           float smoothness = std::stof(valStr);
+                           cfg.cameraSmoothness.store(smoothness, std::memory_order_relaxed);
+                           CameraSystem::getCameraEngine().setSmoothness(smoothness);
+                       } catch (...) {}
                    } else if (key == "tfr_enabled") {
                        cfg.tfrEnabled.store(boolVal, std::memory_order_relaxed);
                        TFR::getTFREngine().setEnabled(boolVal);
                    } else if (key == "tfr_mode") {
-                       int modeVal = std::atoi(value.data());
-                       TFR::TFRMode mode = static_cast<TFR::TFRMode>(modeVal);
-                       cfg.tfrMode.store(mode, std::memory_order_relaxed);
-                       TFR::getTFREngine().setMode(mode);
+                       std::string valStr(value);
+                       try {
+                           int modeVal = std::stoi(valStr);
+                           TFR::TFRMode mode = static_cast<TFR::TFRMode>(modeVal);
+                           cfg.tfrMode.store(mode, std::memory_order_relaxed);
+                           TFR::getTFREngine().setMode(mode);
+                       } catch (...) {}
                    } else if (key == "preserve_hud_tfr") {
                        cfg.preserveHUDInTFR.store(boolVal, std::memory_order_relaxed);
                        TFR::getTFREngine().setHUDPreservation(boolVal);
